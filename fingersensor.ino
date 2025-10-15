@@ -1,4 +1,4 @@
- #include <WiFi.h>
+#include <WiFi.h>
 #include <WebServer.h>
 #include <Adafruit_Fingerprint.h>
 #include <LittleFS.h>
@@ -6,12 +6,13 @@
 #include <Preferences.h>
 
 /* ---------- Hardware Config ---------- */
-HardwareSerial mySerial(1);                 // Secondary Serial for fingerprint sensor
+HardwareSerial mySerial(1);                 
 Adafruit_Fingerprint finger(&mySerial);
 
 #define RELAY_PIN 26
-#define BUTTON_PIN 5
-#define LONG_PRESS_DURATION 5000   // 5 sec → toggle hotspot
+#define BUTTON_WIFI 5
+#define BUTTON_RESET 25
+#define LONG_PRESS_DURATION 5000   // 5 sec
 
 /* ---------- WiFi Hotspot Config ---------- */
 const char* apSSID = "SmartBikeAPI";
@@ -21,19 +22,29 @@ const char* apPassword = "123456789";
 WebServer server(80);
 
 /* ---------- Global Variables ---------- */
-bool hotspotMode = true;      // true = hotspot ON (default)
+bool hotspotMode = true;      
 unsigned long pressStart = 0;
-bool buttonState = false;
 uint8_t lastID = 0;
-#define MAX_FINGERPRINTS 300   // 🔒 MAX 300 limit
+#define MAX_FINGERPRINTS 300  
+
+/* ---------- Button Variables ---------- */
+unsigned long wifiPressStart = 0;
+bool wifiButtonState = false;
+unsigned long resetPressStart = 0;
+bool resetButtonState = false;
 
 /* ---------- LittleFS JSON File ---------- */
 #define FILE_PATH "/fingerprints.json"
 DynamicJsonDocument jsonDoc(4096);
 Preferences prefs;
 String adminUser = "admin";
-String adminPass = "admin";
+String adminPass = "";
 String currentToken = "";
+
+/* ---------- Relay Control ---------- */
+unsigned long relayStart = 0;
+bool relayOn = false;
+const int RELAY_DURATION = 2000;  // 2 sec
 
 /* ---------- Helper Functions ---------- */
 void saveFingerprintData(JsonArray& arr) {
@@ -60,78 +71,56 @@ uint8_t getNextAvailableID() {
   for (int i = 1; i <= lastID; i++) {
     if (finger.loadModel(i) != FINGERPRINT_OK) return i;
   }
-  return 0; // no empty slot
+  return 0;
 }
 
 /* ---------- Fingerprint Enrollment ---------- */
 uint8_t enrollFingerprint(uint8_t id) {
   int p = -1;
   Serial.print("Enrollment start for ID "); Serial.println(id);
-
-  // Step 1: ask to place finger (first time)
-  Serial.println(">>> Please place your finger to add");
+  Serial.println(">>> Place your finger (1st time)");
   while (p != FINGERPRINT_OK) {
     p = finger.getImage();
     if (p == FINGERPRINT_NOFINGER) { delay(50); continue; }
-    if (p == FINGERPRINT_OK) {
-      Serial.println("Image taken (1st)");
-      finger.LEDcontrol(FINGERPRINT_LED_BLUE, 0, 0);
-    } else { Serial.println("Failed to capture (1st)."); return p; }
+    if (p == FINGERPRINT_OK) { Serial.println("Image taken (1st)"); finger.LEDcontrol(FINGERPRINT_LED_BLUE,0,0); }
+    else { Serial.println("Failed to capture (1st)"); return p; }
   }
+  if ((p=finger.image2Tz(1))!=FINGERPRINT_OK){ Serial.println("image2Tz(1) failed"); return p; }
 
-  p = finger.image2Tz(1);
-  if (p != FINGERPRINT_OK) { Serial.println("image2Tz(1) failed"); return p; }
-
-  // Step 2: remove finger
   Serial.println("Remove finger...");
-  delay(1000);
-  while (finger.getImage() != FINGERPRINT_NOFINGER) { delay(50); }
+  delay(1000); while(finger.getImage()!=FINGERPRINT_NOFINGER){delay(50);}
 
-  // Step 3: place same finger again
-  Serial.println(">>> Please place the SAME finger again");
-  p = -1;
-  while (p != FINGERPRINT_OK) {
-    p = finger.getImage();
-    if (p == FINGERPRINT_NOFINGER) { delay(50); continue; }
-    if (p == FINGERPRINT_OK) {
-      Serial.println("Image taken (2nd)");
-      finger.LEDcontrol(FINGERPRINT_LED_BLUE, 0, 0);
-    } else { Serial.println("Failed to capture (2nd)."); return p; }
+  Serial.println(">>> Place SAME finger (2nd time)");
+  p=-1; while(p!=FINGERPRINT_OK){
+    p=finger.getImage();
+    if(p==FINGERPRINT_NOFINGER){delay(50); continue;}
+    if(p==FINGERPRINT_OK){Serial.println("Image taken (2nd)"); finger.LEDcontrol(FINGERPRINT_LED_BLUE,0,0);}
+    else {Serial.println("Failed to capture (2nd)"); return p;}
   }
-
-  p = finger.image2Tz(2);
-  if (p != FINGERPRINT_OK) { Serial.println("image2Tz(2) failed"); return p; }
-
-  // Step 4: create + store model
-  p = finger.createModel();
-  if (p != FINGERPRINT_OK) { Serial.println("createModel failed"); return p; }
-
-  p = finger.storeModel(id);
-  if (p == FINGERPRINT_OK) {
+  if((p=finger.image2Tz(2))!=FINGERPRINT_OK){Serial.println("image2Tz(2) failed"); return p;}
+  if((p=finger.createModel())!=FINGERPRINT_OK){Serial.println("createModel failed"); return p;}
+  if((p=finger.storeModel(id))==FINGERPRINT_OK){
     Serial.println("Enrollment successful!");
-    finger.LEDcontrol(FINGERPRINT_LED_BLUE, 100, 500);
+    finger.LEDcontrol(FINGERPRINT_LED_BLUE,100,500);
     delay(400);
-    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0);
+    finger.LEDcontrol(FINGERPRINT_LED_OFF,0,0);
     return true;
   }
   return p;
 }
 
 /* ---------- Token & Login ---------- */
-String generateToken() {
-  String t = "";
-  for(int i = 0; i < 24; i++) t += String(random(0,16), HEX);
-  return t;
-}
+String generateToken(){String t=""; for(int i=0;i<24;i++) t+=String(random(0,16),HEX); return t;}
 
-bool checkToken() {
+bool checkToken(){
   if(!server.hasHeader("Authorization")) return false;
-  String auth = server.header("Authorization");
+  String auth=server.header("Authorization");
   if(!auth.startsWith("Bearer ")) return false;
-  String tok = auth.substring(7);
-  return tok == currentToken && currentToken.length() > 0;
+  String tok=auth.substring(7);
+  return tok==currentToken && currentToken.length()>0;
 }
 
+/* ---------- API Handlers ---------- */
 void handleLogin() {
   if(!server.hasArg("plain")) { 
     server.send(400,"application/json","{\"error\":\"Missing payload\"}"); return; 
@@ -150,36 +139,23 @@ void handleLogin() {
   } else server.send(401,"application/json","{\"error\":\"Invalid credentials\"}");
 }
 
-/* ---------- API: Add (POST /add) ---------- */
 void handleAdd() {
   if(!checkToken()){ server.send(401,"application/json","{\"error\":\"Unauthorized\"}"); return; }
-
-  if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing payload\"}");
-    return;
-  }
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing payload\"}"); return; }
 
   String body = server.arg("plain");
   DynamicJsonDocument doc(512);
   DeserializationError error = deserializeJson(doc, body);
 
-  if (error || !doc.containsKey("name")) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON or missing name\"}");
-    return;
-  }
+  if (error || !doc.containsKey("name")) { server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON or missing name\"}"); return; }
 
+  jsonDoc.clear();
   JsonArray arr = loadFingerprintData(jsonDoc);
-  if (arr.size() >= MAX_FINGERPRINTS) {   
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Max 300 fingerprints reached, delete some first\"}");
-    return;
-  }
+  if (arr.size() >= MAX_FINGERPRINTS) { server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Max 300 fingerprints reached\"}"); return; }
 
   String name = doc["name"];
   uint8_t newID = getNextAvailableID();
-  if (newID == 0) {
-    server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"No empty slot available\"}");
-    return;
-  }
+  if (newID == 0) { server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"No empty slot available\"}"); return; }
 
   int res = enrollFingerprint(newID);
   if (res == true) {
@@ -195,166 +171,170 @@ void handleAdd() {
   }
 }
 
-/* ---------- API: List (GET /list) ---------- */
 void handleList() {
   if(!checkToken()){ server.send(401,"application/json","{\"error\":\"Unauthorized\"}"); return; }
-
+  jsonDoc.clear();
   JsonArray arr = loadFingerprintData(jsonDoc);
-  String output;
-  serializeJson(arr, output);
+  String output; serializeJson(arr, output);
   server.send(200, "application/json", output);
 }
 
-/* ---------- API: Delete by ID (POST /delete) ---------- */
 void handleDelete() {
   if(!checkToken()){ server.send(401,"application/json","{\"error\":\"Unauthorized\"}"); return; }
-
-  if (!server.hasArg("plain")) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing payload\"}");
-    return;
-  }
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing payload\"}"); return; }
 
   String body = server.arg("plain");
   DynamicJsonDocument doc(256);
   DeserializationError error = deserializeJson(doc, body);
 
-  if (error || !doc.containsKey("id")) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON or missing id\"}");
-    return;
-  }
+  if (error || !doc.containsKey("id")) { server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON or missing id\"}"); return; }
 
   int idToDelete = doc["id"];
+  jsonDoc.clear();
   JsonArray arr = loadFingerprintData(jsonDoc);
   int foundIndex = -1;
+  for (int i = 0; i < (int)arr.size(); i++) if ((int)arr[i]["id"] == idToDelete) { foundIndex = i; break; }
 
-  for (int i = 0; i < (int)arr.size(); i++) {
-    if ((int)arr[i]["id"] == idToDelete) {
-      foundIndex = i;
-      break;
-    }
-  }
-
-  if (foundIndex == -1) {
-    server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"ID not found\"}");
-    return;
-  }
+  if (foundIndex == -1) { server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"ID not found\"}"); return; }
 
   finger.deleteModel(idToDelete);
   arr.remove(foundIndex);
   saveFingerprintData(arr);
-
   server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Deleted\",\"id\":" + String(idToDelete) + "}");
 }
 
-/* ---------- API: Change Password ---------- */
 void handleChangePassword(){
   if(!checkToken()){ server.send(401,"application/json","{\"error\":\"Unauthorized\"}"); return; }
   if(!server.hasArg("plain")){ server.send(400,"application/json","{\"error\":\"Missing payload\"}"); return; }
 
   DynamicJsonDocument d(256);
   deserializeJson(d, server.arg("plain"));
-  if(!d.containsKey("oldpassword") || !d.containsKey("newpassword")){ 
-    server.send(400,"application/json","{\"error\":\"Missing fields\"}"); return; 
-  }
+  if(!d.containsKey("oldpassword") || !d.containsKey("newpassword")){ server.send(400,"application/json","{\"error\":\"Missing fields\"}"); return; }
 
   String oldPass = d["oldpassword"].as<String>();
   String newPass = d["newpassword"].as<String>();
-  if(oldPass != adminPass){ server.send(403,"application/json","{\"error\":\"Old password incorrect\"}"); return; }
+
+  prefs.begin("bike", false);
+  String storedPass = prefs.getString("adminPass", "admin");
+
+  if(oldPass != storedPass){
+    prefs.end();
+    server.send(403,"application/json","{\"error\":\"Old password incorrect\"}");
+    return; 
+  }
+
+  prefs.putString("adminPass", newPass);
+  prefs.end();
 
   adminPass = newPass;
   server.send(200,"application/json","{\"status\":\"Password changed\"}");
 }
 
-/* ---------- API: Factory Reset ---------- */
 void handleReset(){
   if(!checkToken()){ server.send(401,"application/json","{\"error\":\"Unauthorized\"}"); return; }
 
   finger.emptyDatabase();
+  prefs.begin("bike", false);
   prefs.clear();
+  prefs.putString("adminPass", "admin");
+  prefs.end();
 
-  DynamicJsonDocument doc(4096);
-  JsonArray arr = doc.to<JsonArray>();
+  jsonDoc.clear();
+  JsonArray arr = jsonDoc.to<JsonArray>();
   saveFingerprintData(arr);
+
+  adminPass = "admin";
 
   server.send(200,"application/json","{\"status\":\"Factory Reset Done\"}");
 }
 
-/* ---------- Button & Hotspot ---------- */
-void handleButton() {
-  bool current = digitalRead(BUTTON_PIN) == HIGH; // Active HIGH
-  if (current && !buttonState) {
-    pressStart = millis();
-    buttonState = true;
+/* ---------- Fingerprint Check (Normal Mode) ---------- */
+void checkFingerprint(){
+  int p = finger.getImage();
+  if(p == FINGERPRINT_NOFINGER){ 
+    return;
   }
-  if (!current && buttonState) {
-    unsigned long pressTime = millis() - pressStart;
-    buttonState = false;
+  if(p != FINGERPRINT_OK){ 
+    Serial.println("Error reading finger"); 
+    return; 
+  }
+  if((p = finger.image2Tz()) != FINGERPRINT_OK){ 
+    Serial.println("Image2Tz error"); 
+    return; 
+  }
+  if((p = finger.fingerSearch()) == FINGERPRINT_OK){
+    Serial.print("✅ Fingerprint matched! ID: "); 
+    Serial.println(finger.fingerID);
+    finger.LEDcontrol(FINGERPRINT_LED_BLUE,0,0); 
 
-    if (pressTime >= LONG_PRESS_DURATION) { // 5 sec press
-      hotspotMode = !hotspotMode;
-      if (hotspotMode) {
-        WiFi.softAP(apSSID, apPassword);
-        Serial.println("🌐 Hotspot Enabled");
-      } else {
-        WiFi.softAPdisconnect(true);
-        Serial.println("❌ Hotspot Disabled");
-      }
-    }
+    relayOn = true;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("🔒 Relay ON - stays ON until power off");
+  } 
+  else { 
+    Serial.println("❌ Fingerprint not found"); 
+    finger.LEDcontrol(FINGERPRINT_LED_OFF,0,0);
+    digitalWrite(RELAY_PIN, LOW);
   }
 }
 
-/* ---------- Fingerprint Check (Normal Mode) ---------- */
-void checkFingerprint() {
-  int p = finger.getImage();
-  if (p != FINGERPRINT_OK) return;
+/* ---------- Button Handlers ---------- */
+void handleButtons(){
+  bool wifiCurrent = digitalRead(BUTTON_WIFI) == LOW;
+  if(wifiCurrent && !wifiButtonState){ wifiPressStart=millis(); wifiButtonState=true; }
+  if(!wifiCurrent && wifiButtonState){
+    wifiButtonState=false;
+    if(millis()-wifiPressStart >= LONG_PRESS_DURATION){
+      hotspotMode=!hotspotMode;
+      if(hotspotMode){ WiFi.softAP(apSSID,apPassword); Serial.println("🌐 Hotspot Enabled"); }
+      else { WiFi.softAPdisconnect(true); Serial.println("❌ Hotspot Disabled"); }
+    }
+  }
 
-  p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) return;
-
-  p = finger.fingerSearch();
-
-  if (p == FINGERPRINT_OK) {
-    Serial.print("✅ Fingerprint matched! ID: "); Serial.println(finger.fingerID);
-    finger.LEDcontrol(FINGERPRINT_LED_BLUE, 0, 0);  
-    digitalWrite(RELAY_PIN, HIGH);
-    delay(2000);
-    digitalWrite(RELAY_PIN, LOW);
-  } 
-  else if (p == FINGERPRINT_NOTFOUND) {
-    Serial.println("❌ Fingerprint not found");
-    finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0);
+  bool resetCurrent = digitalRead(BUTTON_RESET) == LOW;
+  if(resetCurrent && !resetButtonState){ resetPressStart=millis(); resetButtonState=true; }
+  if(!resetCurrent && resetButtonState){
+    resetButtonState=false;
+    if(millis()-resetPressStart >= LONG_PRESS_DURATION){
+      Serial.println("⚠️ Factory Reset Triggered!");
+      handleReset();
+    }
   }
 }
 
 /* ---------- Setup ---------- */
 void setup() {
   Serial.begin(9600);
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  digitalWrite(RELAY_PIN, LOW);
+  pinMode(RELAY_PIN,OUTPUT);
+  pinMode(BUTTON_WIFI,INPUT_PULLUP);
+  pinMode(BUTTON_RESET,INPUT_PULLUP);
+  digitalWrite(RELAY_PIN,LOW);
+  mySerial.begin(57600,SERIAL_8N1,16,17);
+  
+  if(!finger.verifyPassword()){Serial.println("❌ Sensor not found!"); while(1);}
+  if(!LittleFS.begin(true)){Serial.println("LittleFS mount failed!"); while(1);}
 
-  mySerial.begin(57600, SERIAL_8N1, 16, 17);
+  prefs.begin("bike", false);
+  adminPass = prefs.getString("adminPass", "admin");
+  prefs.end();
 
-  if (!finger.verifyPassword()) { Serial.println("❌ Fingerprint sensor not found!"); while(1); }
-  if (!LittleFS.begin(true)) { Serial.println("LittleFS mount failed!"); while(1); }
+  WiFi.softAP(apSSID,apPassword); Serial.println("🌍 Hotspot started: SmartBikeAPI");
 
-  WiFi.softAP(apSSID, apPassword);
-  Serial.println("🌍 Hotspot started: SmartBikeAPI");
-
-  server.on("/login", HTTP_POST, handleLogin);      // Login endpoint
+  server.on("/login", HTTP_POST, handleLogin);
   server.on("/add", HTTP_POST, handleAdd);
   server.on("/list", HTTP_GET, handleList);
   server.on("/delete", HTTP_POST, handleDelete);
-  server.on("/reset", HTTP_POST, handleReset);
   server.on("/changepassword", HTTP_POST, handleChangePassword);
+  server.on("/reset", HTTP_POST, handleReset);
 
-  server.begin();
-  Serial.println("🌐 WebServer started on port 80");
+  server.begin(); Serial.println("🌐 WebServer started");
 }
 
 /* ---------- Loop ---------- */
 void loop() {
   server.handleClient();
-  handleButton();
-  if (!hotspotMode) checkFingerprint(); 
+  handleButtons();
+  checkFingerprint();
+
+  if(relayOn) digitalWrite(RELAY_PIN,HIGH);
 }
